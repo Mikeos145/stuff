@@ -1,0 +1,986 @@
+-- CREATE DATE SCAFFOLD TABLE
+DROP TABLE IF EXISTS `woe-system.tableau.date_scaffold`; 
+CREATE TABLE `woe-system.tableau.date_scaffold` AS
+SELECT day,
+CASE 
+WHEN extract(dayofweek from day) = 1 THEN 'Sunday'
+WHEN extract(dayofweek from day) = 2 THEN 'Monday'
+WHEN extract(dayofweek from day) = 3 THEN 'Tuesday'
+WHEN extract(dayofweek from day) = 4 THEN 'Wednesday'
+WHEN extract(dayofweek from day) = 5 THEN 'Thursday'
+WHEN extract(dayofweek from day) = 6 THEN 'Friday'
+WHEN extract(dayofweek from day) = 7 THEN 'Saturday'
+ELSE NULL END AS day_of_week
+FROM UNNEST(GENERATE_DATE_ARRAY(DATE('2020-01-01'), CURRENT_DATE(), INTERVAL 1 DAY)) as day;
+
+-- CREATE EVENT TABLE WITH US ID REWORK
+DROP TABLE IF EXISTS `woe-system.tableau.events_user_id_rework`; 
+CREATE TABLE `woe-system.tableau.events_user_id_rework` AS
+  WITH `cte_pseudo_user_id_retro` AS -- CREATE TABLE TO RESTROSPECTIVELY APPLY USER ID TO NOW KNOWN USERS BASED ON GOOGLE'S PSUEDO USER ID
+  (SELECT user_pseudo_id, 
+  coalesce(user_id,
+              (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'user_id'),
+                  (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'user_id_wone')) AS user_id_retro,
+  COUNT(*) AS COUNT,
+  ROW_NUMBER() OVER (PARTITION BY user_pseudo_id ORDER BY COUNT(*) DESC) AS id_prevalence_order  
+  FROM `woe-system.analytics_249627001.events_*`, UNNEST(event_params) as params_join
+  LEFT JOIN (SELECT * FROM `woe-system.postgres_rds_public.auth_user` WHERE _fivetran_deleted = FALSE) ON coalesce(user_id,
+              (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'user_id'),
+                  (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'user_id_wone')) = CAST(id AS STRING) AND _fivetran_deleted = FALSE
+  WHERE user_pseudo_id IS NOT NULL AND coalesce(user_id,
+              (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'user_id'),
+                  (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'user_id_wone')) IS NOT NULL
+  GROUP BY 1,2
+  ORDER BY 1 desc), 
+    `cte_user_id_retro` AS (SELECT CAST(user_pseudo_id AS STRING) AS user_pseudo_id_retro, CAST(user_id_retro AS STRING) AS user_id_retro FROM `cte_pseudo_user_id_retro` WHERE id_prevalence_order = 1),
+      `cte_visit_length` AS (SELECT (SELECT value.int_value FROM UNNEST(event_params) WHERE key ='ga_session_id') as ga_session_id,
+                                ROUND(CAST((TIMESTAMP_DIFF(max(timestamp_micros(event_timestamp)), min(timestamp_micros(event_timestamp)), second)/60)*1.00 AS FLOAT64),2) AS visit_length_minutes
+                                FROM `woe-system.analytics_249627001.events_*` 
+                                group by 1
+                                HAVING TIMESTAMP_DIFF(max(timestamp_micros(event_timestamp)), min(timestamp_micros(event_timestamp)), second) >= 1)
+            SELECT EV.*, 
+                  coalesce(CAST(EV.user_id AS STRING),
+                                CAST((SELECT value.string_value FROM UNNEST(EV.event_params) WHERE key = 'user_id') AS STRING),
+                                    CAST((SELECT value.string_value FROM UNNEST(EV.event_params) WHERE key = 'user_id_wone') AS STRING),
+                                        IDR.user_id_retro, 
+                                          EV.user_pseudo_id) AS auth_pseudo_user_id,
+                  visit_length_minutes,
+                  COALESCE((SELECT value.string_value FROM UNNEST(event_params) where key = 'firebase_screen_class'),(SELECT value.string_value FROM UNNEST(event_params) where key = 'page_title')) AS page_name -- DOUBLE CHECK THIS
+            FROM `woe-system.analytics_249627001.events_*` AS EV            
+            LEFT JOIN `cte_user_id_retro` AS IDR
+            ON EV.user_pseudo_id = IDR.user_pseudo_id_retro
+            LEFT JOIN `cte_visit_length` VL
+            ON (SELECT value.int_value FROM UNNEST(EV.event_params) WHERE key ='ga_session_id') = VL.ga_session_id AND event_name = 'session_start'
+            AND event_date >= '2022-05-01';  
+
+-- CREATE TABLE FOR USER TABLE
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_tab_user_table_prep`;
+CREATE TABLE `woe-system.tableau.tbl_tab_user_table_prep` AS
+  WITH `cte_user_level_platform_prep` AS (SELECT 
+  auth_pseudo_user_id,
+  platform as user_modal_platform,
+  COUNT(*) AS COUNT,
+  ROW_NUMBER() OVER (PARTITION BY auth_pseudo_user_id ORDER BY COUNT(*) DESC) AS platform_prevalence_order  
+  FROM `woe-system.tableau.events_user_id_rework` AS EV
+  WHERE auth_pseudo_user_id IS NOT NULL AND platform IS NOT NULL AND event_name = 'session_start'
+  GROUP BY auth_pseudo_user_id, platform
+  ORDER BY 1),
+    `cte_user_level_platform` AS (SELECT auth_pseudo_user_id, user_modal_platform, FROM `cte_user_level_platform_prep` WHERE platform_prevalence_order = 1)
+        SELECT COALESCE(CAST(AU.id AS STRING), auth_pseudo_user_id) AS auth_pseudo_user_id, 
+          STD.ID AS student_id,
+          CONCAT(AU.first_name,' ',AU.last_name) AS au_name, 
+          AU.first_name,
+          AU.last_name,
+          AU.email, 
+          CCC.name AS company_name,
+          AU.is_active, 
+          CAST(AU.date_joined AS DATE) AS date_joined,
+          CAST(LEFT(CAST(USD.deactivated_date_time AS STRING),19) AS TIMESTAMP) as deactivated_datetime,
+          CAST(USD.deactivated_date_time AS DATE) as deactivated_date,
+          CASE WHEN OB.created_at IS NULL AND CI.timezone IS NULL THEN NULL ELSE CASE WHEN OB.created_at IS NULL AND CI.timezone IS NOT NULL THEN CI.timezone ELSE USD.timezone END END AS timezone,
+          -- WHY WOULD BOTH TIMEZONE AND CREATED AT BE NULL
+          ULP.user_modal_platform,
+          CASE WHEN CI.reporting_flag IS NULL THEN 'No' ELSE CI.reporting_flag END AS reporting_flag,
+          CASE WHEN CI.active_flag IS NULL THEN 'No' ELSE CI.active_flag END AS active_flag,
+          kick_off_date,
+          termination_date,
+          last_login,
+          core_clients
+        FROM (SELECT * FROM `woe-system.postgres_rds_public.auth_user` WHERE _fivetran_deleted = FALSE)  AS AU
+          LEFT JOIN `woe-system.postgres_rds_public.users_userdetail` AS USD ON AU.id = USD.user_obj_id AND USD._fivetran_deleted = FALSE
+            LEFT JOIN `woe-system.postgres_rds_public.students_studentdetail` AS STD ON AU.id = STD.userdetail_obj_id AND STD._fivetran_deleted = FALSE
+              LEFT JOIN `woe-system.postgres_rds_public.companies_corporatecompany` AS CCC ON STD.company_id = CCC.id AND CCC._fivetran_deleted = FALSE
+                FULL JOIN `cte_user_level_platform` AS ULP ON  CAST(AU.id AS STRING) = ULP.auth_pseudo_user_id
+                  INNER JOIN `woe-system.google_drive.commercial_info_client_start_end` AS CI ON CCC.name = CI.company_name
+                    LEFT JOIN `woe-system.postgres_rds_public.students_onboarding` OB ON STD.id = OB.studentdetail_obj_id 
+        WHERE UPPER(CI.reporting_flag) = 'YES' 
+        AND CASE WHEN LOWER(ccc.name) like '%howard%' AND LOWER(email) NOT LIKE '%@brevanhoward%' AND LOWER(email) NOT LIKE '%@alanhoward%' THEN 0 ELSE 1 END = 1
+        ORDER BY 5;
+
+
+
+-- CREATE TABLE AUTOSTORE PSEUDO_USER_TABLE
+DROP TABLE IF EXISTS `woe-system.tableau.auto_store_psudo_users_table`;
+CREATE TABLE `woe-system.tableau.auto_store_psudo_users_table` AS
+SELECT
+  CAST(1212015192015185+num AS STRING) AS auth_pseudo_user_id,
+  null as student_id,
+  CAST(null AS STRING) AS au_name,
+  CAST(null AS STRING) AS first_name,
+  CAST(null AS STRING) AS last_name,
+  CAST(null AS STRING) AS email,
+  'Autostore' AS company_name,
+  TRUE AS is_active,
+  CAST((SELECT kick_off_date FROM `woe-system.google_drive.commercial_info_client_start_end` WHERE company_name = 'Autostore') AS DATE) AS date_joined, -- NEED REAL START AND END DATE FOR USERS BASED ON LEAVERS AND ROSTER CHANGES
+  CAST(null AS TIMESTAMP) AS deactivated_datetime,
+  CAST(null AS DATE) AS deactivated_date,
+  (SELECT timezone FROM `woe-system.google_drive.commercial_info_client_start_end` WHERE company_name = 'Autostore')  AS timezone,
+  CAST(null AS STRING) AS user_modal_platform,
+  'Yes' AS reporting_flag,
+  'Yes' AS active_flag,
+  (SELECT kick_off_date FROM `woe-system.google_drive.commercial_info_client_start_end` WHERE company_name = 'Autostore') AS kick_off_date,
+  CAST(null AS STRING) AS termination_date,
+  CAST(null AS TIMESTAMP) AS last_login,
+  'Yes' AS core_clients
+FROM (
+  SELECT 
+    GENERATE_ARRAY(0, (
+      SELECT roster
+      FROM `woe-system.google_drive.commercial_info_client_start_end`
+      WHERE company_name = 'Autostore'
+    ) - (
+      SELECT COUNT(DISTINCT auth_pseudo_user_id)
+      FROM `woe-system.tableau.tbl_tab_user_table_prep`
+      WHERE is_active IS TRUE
+      AND company_name = 'Autostore'
+    )) AS nums
+)
+CROSS JOIN UNNEST(nums) AS num;
+
+-- CREATE TABLE AUTOSTORE PSEUDO_USER_TABLE
+DROP TABLE IF EXISTS `woe-system.tableau.mofo_psudo_users_table`;
+CREATE TABLE `woe-system.tableau.mofo_psudo_users_table` AS
+SELECT
+  CAST(131818915191415+num AS STRING) AS auth_pseudo_user_id,
+  null as student_id,
+  CAST(null AS STRING) AS au_name,
+  CAST(null AS STRING) AS first_name,
+  CAST(null AS STRING) AS last_name,
+  CAST(null AS STRING) AS email,
+  'MoFo' AS company_name,
+  TRUE AS is_active,
+  CAST((SELECT kick_off_date FROM `woe-system.google_drive.commercial_info_client_start_end` WHERE company_name = 'MoFo') AS DATE) AS date_joined, -- NEED REAL START AND END DATE FOR USERS BASED ON LEAVERS AND ROSTER CHANGES
+  CAST(null AS TIMESTAMP) AS deactivated_datetime,
+  CAST(null AS DATE) AS deactivated_date,
+  (SELECT timezone FROM `woe-system.google_drive.commercial_info_client_start_end` WHERE company_name = 'MoFo')  AS timezone,
+  CAST(null AS STRING) AS user_modal_platform,
+  'Yes' AS reporting_flag,
+  'Yes' AS active_flag,
+  (SELECT kick_off_date FROM `woe-system.google_drive.commercial_info_client_start_end` WHERE company_name = 'MoFo') AS kick_off_date,
+  CAST(null AS STRING) AS termination_date,
+  CAST(null AS TIMESTAMP) AS last_login,
+  'Yes' AS core_clients
+FROM (
+  SELECT 
+    GENERATE_ARRAY(0, (
+      SELECT roster
+      FROM `woe-system.google_drive.commercial_info_client_start_end`
+      WHERE company_name = 'MoFo'
+    ) - (
+      SELECT COUNT(DISTINCT auth_pseudo_user_id)
+      FROM `woe-system.tableau.tbl_tab_user_table_prep`
+      WHERE is_active IS TRUE
+      AND company_name = 'MoFo'
+    )) AS nums
+)
+CROSS JOIN UNNEST(nums) AS num;
+
+
+-- CREATE TABLE FOR USER TABLE
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_tab_user_table`;
+CREATE TABLE `woe-system.tableau.tbl_tab_user_table` AS
+SELECT * 
+FROM `woe-system.tableau.tbl_tab_user_table_prep`
+UNION ALL
+SELECT * 
+FROM `woe-system.tableau.auto_store_psudo_users_table`
+UNION ALL
+SELECT * FROM `woe-system.tableau.mofo_psudo_users_table`;
+
+
+-- CREATES ROSTER PREP TABLE ACTIVE USERS V1
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_user_active_over_time`;
+CREATE TABLE `woe-system.tableau.tbl_user_active_over_time` AS
+SELECT DS.day,
+UT.auth_pseudo_user_id,
+UT.student_id,
+UT.first_name,
+UT.last_name,
+UT.email,
+UT.is_active as user_active_flag,
+UT.company_name,
+UT.reporting_flag,
+UT.active_flag,
+UT.timezone,
+UT.user_modal_platform,
+UT.kick_off_date,
+UT.termination_date,
+UT.core_clients,
+CASE WHEN is_active = FALSE THEN GREATEST(COALESCE(DATE(last_login),DATE(UT.deactivated_datetime)),COALESCE(DATE(UT.deactivated_datetime),DATE(last_login))) ELSE NULL END AS deactivated_date,
+UT.date_joined,
+UT.last_login
+FROM `woe-system.tableau.date_scaffold` AS DS
+CROSS JOIN `woe-system.tableau.tbl_tab_user_table` AS UT
+WHERE UPPER(UT.reporting_flag) = 'YES'
+-- AND CASE WHEN IS_ACTIVE = TRUE AND DS.day >= DATE(UT.date_joined) THEN 1
+--     ELSE CASE WHEN IS_ACTIVE = FALSE AND COALESCE(DATE(last_login),DATE(UT.deactivated_datetime)) IS NULL THEN 0 
+--         ELSE CASE WHEN IS_ACTIVE = FALSE AND day < 
+--           CASE WHEN DATE(UT.deactivated_datetime) IS NULL THEN DATE(last_login) ELSE DATE(UT.deactivated_datetime) END 
+--             AND DS.day >= CAST(UT.date_joined AS DATE) THEN 1 ELSE 0 END END END > 0
+ORDER BY 2,1,3,4 ASC;
+
+
+-- CREATES SEATS AND EMPLOYEES STAGING TABLE
+DROP TABLE IF EXISTS `woe-system.tableau.staging_seats_and_employees`;
+CREATE TABLE `woe-system.tableau.staging_seats_and_employees` AS
+WITH `cte_enterprise_seats` AS 
+(SELECT day, property_name AS company_name, CAST(CPH.company_id AS STRING) AS company_id, CAST(_fivetran_start AS DATE) AS start_date, CAST(_fivetran_end AS DATE) AS end_date, CAST(value AS INT) as seats, "Enterprise" AS client_type
+FROM `woe-system.hubspot_complete.company_property_history` CPH
+LEFT JOIN `woe-system.hubspot_complete.company` C ON CPH.company_id = C.id
+CROSS JOIN `woe-system.tableau.date_scaffold` AS DS
+LEFT JOIN `woe-system.google_drive.commercial_info_client_start_end` AS CI ON C.property_name = CI.company_name 
+where name IN ('number_of_confirmed_learners_in_license') 
+AND day BETWEEN CAST(_fivetran_start AS DATE) AND CAST(_fivetran_end AS DATE)
+order by property_name, day asc),
+
+    `cte_starter_seats` AS (SELECT day, UT.company_name, CAST(customer_id AS STRING), CAST(ILI.period_start AS DATE), CAST(ILI.period_end AS DATE), CAST(ILI.quantity AS INT) AS seats, "Starter" as type
+    FROM `woe-system.stripe.invoice` AS I
+    LEFT JOIN `woe-system.stripe.invoice_line_item` AS ILI ON I.id = ILI.invoice_id
+    LEFT JOIN `woe-system.stripe.customer` AS CU ON I.customer_id = CU.id
+    LEFT JOIN `woe-system.tableau.tbl_tab_user_table` AS UT ON CU.email = UT.email
+    CROSS JOIN `woe-system.tableau.date_scaffold` AS DS
+    LEFT JOIN `woe-system.google_drive.commercial_info_client_start_end` AS CI ON UT.company_name = CI.company_name 
+    WHERE (ILI.description = 'Trial period for Starter Plan' OR ILI.description like '%× Starter Plan%')
+    AND CAST(day AS DATE) BETWEEN CAST(ILI.period_start AS DATE) AND CAST(ILI.period_end AS DATE)),
+
+       `cte_total_employees_enterprise` AS 
+       (SELECT day, property_name AS company_name, CAST(CPH.company_id AS STRING) AS company_id, CAST(_fivetran_start AS DATE) AS start_date, CAST(_fivetran_end AS DATE) AS end_date, CAST(CASE WHEN LENGTH(value) = 0 THEN NULL ELSE value END AS FLOAT64) AS total_employees, 
+       "Enterprise" AS type
+        FROM `woe-system.hubspot_complete.company_property_history` CPH
+        LEFT JOIN `woe-system.hubspot_complete.company` C ON CPH.company_id = C.id
+        CROSS JOIN `woe-system.tableau.date_scaffold` AS DS
+        LEFT JOIN `woe-system.google_drive.commercial_info_client_start_end` AS CI ON C.property_name = CI.company_name 
+        where name IN ('numberofemployees') 
+        AND day BETWEEN CAST(_fivetran_start AS DATE) AND CAST(_fivetran_end AS DATE)
+        order by property_name, day desc)
+
+
+            SELECT SE.day, SE.company_name, SE.company_id, SE.client_type, MAX(SE.seats) AS seats, MAX(EN.total_employees) AS total_employees 
+            FROM
+            ((SELECT * FROM `cte_enterprise_seats`)
+            UNION DISTINCT 
+            (SELECT * FROM `cte_starter_seats`)) AS SE
+            LEFT JOIN `cte_total_employees_enterprise` AS EN ON SE.day = EN.day AND SE.company_id = EN.company_id
+            GROUP BY SE.day, SE.company_name, SE.company_id, SE.client_type;
+
+
+
+-- CREATES ROSTER, SEATS AND EMPLOYEES TABLES FINAL
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_roster_seats_and_employees`;
+CREATE TABLE `woe-system.tableau.tbl_roster_seats_and_employees` AS
+WITH `cte_roster_employee_diff` AS (SELECT AUOT.day, AUOT.company_name, AUOT.kick_off_date, AUOT.termination_date, AUOT.core_clients, SEEN.client_type, SEEN.total_employees, SEEN.seats, COUNT(DISTINCT auth_pseudo_user_id) AS total_users, SEEN.seats - COUNT(DISTINCT auth_pseudo_user_id) AS spare_seats, SEEN.total_employees - SEEN.seats as untapped_employees
+FROM `woe-system.tableau.tbl_user_active_over_time` AS AUOT 
+LEFT JOIN `woe-system.tableau.staging_seats_and_employees` AS SEEN
+ON AUOT.day = SEEN.day and AUOT.company_name = SEEN.company_name 
+GROUP BY AUOT.day, AUOT.company_name, AUOT.kick_off_date, AUOT.termination_date, AUOT.core_clients, SEEN.client_type, SEEN.seats, SEEN.total_employees),
+
+    `cte_new_user_list` AS (SELECT new_user_no_list
+    FROM (SELECT 0 as min_num, MAX(untapped_employees) as max_num
+          FROM `cte_roster_employee_diff`
+          ) AS RED CROSS JOIN
+        UNNEST(GENERATE_ARRAY(RED.min_num, RED.max_num)) AS new_user_no_list),
+
+        `cte_excess_employee` AS (SELECT red_1.day, CASE WHEN red_2.new_user_no_list <= spare_seats THEN CONCAT("spare_seat_",red_2.new_user_no_list) ELSE CONCAT("untapped_employee_",red_2.new_user_no_list) END AS excess_user_id, red_1.company_name, red_1.kick_off_date, red_1.termination_date, red_1.core_clients, reporting_flag, active_flag, client_type,
+        FROM `cte_roster_employee_diff` as red_1
+        INNER JOIN `cte_new_user_list` as red_2 ON new_user_no_list <= untapped_employees
+        LEFT JOIN `woe-system.google_drive.commercial_info_client_start_end` AS CI ON red_1.company_name = CI.company_name 
+        order by 3,2,1)
+
+            SELECT UN.*, 
+            GENERATE_UUID() AS event_id,
+            CASE WHEN TD.userdetail_obj_id IS NOT NULL THEN "teacher"
+              ELSE CASE WHEN auth_pseudo_user_id LIKE "%seat%" THEN "Spare Seat" 
+                ELSE CASE WHEN auth_pseudo_user_id LIKE "%untapped%" THEN "Untapped Employee" 
+                  ELSE "Activated User" END END END AS user_type,
+            CASE WHEN 
+             (CASE WHEN TD.userdetail_obj_id IS NOT NULL THEN "teacher"
+              ELSE CASE WHEN auth_pseudo_user_id LIKE "%seat%" THEN "Spare Seat" 
+                ELSE CASE WHEN auth_pseudo_user_id LIKE "%untapped%" THEN "Untapped Employee" 
+                  ELSE "Activated User" END END END) = "Activated User" THEN TIMESTAMP_DIFF(CURRENT_DATE('UTC'), day, DAY) ELSE NULL END AS days_since_joined
+            FROM
+            ((SELECT day, CAST(auth_pseudo_user_id AS STRING) as auth_pseudo_user_id, email, first_name, last_name, user_active_flag, company_name, kick_off_date, termination_date, core_clients, deactivated_date, date_joined, null as client_type, reporting_flag, active_flag, timezone, user_modal_platform FROM `woe-system.tableau.tbl_user_active_over_time`)
+            UNION DISTINCT 
+            (SELECT day, excess_user_id, CAST(NULL AS STRING) AS email, null, null,  null as user_active_flag, company_name, kick_off_date, termination_date, core_clients, null as deactivated_date, null AS date_joined, client_type, reporting_flag, active_flag, CAST(NULL AS STRING), CAST(NULL AS STRING) FROM `cte_excess_employee`)) AS UN
+            LEFT JOIN `woe-system.postgres_rds_public.teachers_teacherdetail` AS TD on CAST(TD.userdetail_obj_id AS STRING) = auth_pseudo_user_id AND TD._fivetran_deleted = FALSE
+            ORDER BY 1,2,3,4,5,6,7,8;
+
+
+-- CREATE RECORDING LOOKUP
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_recording_lookup`;
+CREATE TABLE `woe-system.tableau.tbl_recording_lookup` AS
+SELECT 
+CSG.name,
+CSGI.id AS recording_id,
+CSGI.scheduled_date as session_date,
+CSG.id AS group_session_id,
+CSGI.id AS session_instance_id,
+CSG.pillar_id,
+CS.name AS service_name,
+CC.name as service_name_2,
+CSG.group_session_for,
+CONCAT(AU2.first_name,' ',AU2.last_name) AS teacher_name,
+CASE WHEN CSG.NAME = '5 Minute Breathwork' THEN 5 ELSE TIMESTAMP_DIFF(instance_display_end_date_time, instance_start_date_time, MINUTE) END AS class_length
+FROM (SELECT * FROM `woe-system.postgres_rds_public.class_sessions_groupsessioninstance` WHERE _fivetran_deleted = FALSE) AS CSGI
+LEFT JOIN `woe-system.postgres_rds_public.teachers_teacherdetail` AS TD on TD.id = CSGI.teacher_id AND TD._fivetran_deleted = FALSE
+LEFT JOIN `woe-system.postgres_rds_public.class_sessions_groupsession` AS CSG ON CSG.ID = CSGI.GROUP_SESSION_ID AND CSG._fivetran_deleted = FALSE
+LEFT JOIN `woe-system.postgres_rds_public.auth_user` AS AU2 ON TD.USERDETAIL_OBJ_ID = AU2.ID AND AU2._fivetran_deleted = FALSE
+LEFT JOIN `woe-system.postgres_rds_public.classes_service` AS CS ON CS.ID = CSG.SERVICE_ID AND CS._fivetran_deleted = FALSE
+LEFT JOIN `woe-system.postgres_rds_public.classes_class` AS CC ON CSG.class_obj_id = cc.id AND CC._fivetran_deleted = FALSE;
+
+-- CREATE EVENT TABLE WITH US ID REWORK
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_events_on_demand`; 
+CREATE TABLE `woe-system.tableau.tbl_events_on_demand` AS
+SELECT * FROM (
+SELECT *,
+GENERATE_UUID() AS event_id
+FROM 
+(SELECT 
+DISTINCT
+EV.auth_pseudo_user_id,
+(SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS ga_session_id,
+UT.email,                    
+UT.company_name,
+REPLACE(CASE WHEN ((UPPER(EV.platform) = 'WEB' AND event_name = 'page_view' AND LENGTH(SPLIT(SPLIT((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location'),'articles/')[SAFE_OFFSET(1)],'?')[SAFE_OFFSET(0)])> 0) OR event_name IN ('view_article', 'viewed_article','article_click')) THEN 'article_view' 
+  ELSE CASE WHEN event_name IN ('launched_recorded_video', 'recording_play_click') THEN 'recording_played'
+    ELSE EV.event_name END END,"_"," ") AS event_name,
+REPLACE(CASE WHEN ((UPPER(EV.platform) = 'WEB' AND event_name = 'page_view' AND LENGTH(SPLIT(SPLIT((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location'),'articles/')[SAFE_OFFSET(1)],'?')[SAFE_OFFSET(0)])> 0) OR event_name IN ('view_article', 'viewed_article','article_click','article_view')) THEN 'article' ELSE CASE WHEN event_name IN ('launched_recorded_video', 'recording_play_click', 'recording_played') THEN 'recording' END END,"_"," ") AS content_type,
+EV.platform AS event_platform,
+COALESCE(RL.name, ART.title) AS content_name,
+PARSE_DATE("%Y%m%d", event_date) AS event_date,
+COALESCE(ART.pillar_id, RL.pillar_id) AS pillar_id,
+COALESCE(ART.author, RL.teacher_name) AS practitioner,
+RL.service_name,
+RL.service_name_2,
+RL.class_length,
+RL.session_instance_id,
+RL.session_date,
+NULL AS progress_percentage
+FROM `woe-system.tableau.events_user_id_rework` AS EV
+LEFT JOIN `woe-system.tableau.tbl_tab_user_table` AS UT ON EV.auth_pseudo_user_id = UT.auth_pseudo_user_id
+LEFT JOIN `woe-system.postgres_rds_public.plan_article` AS ART ON TRIM(ART.title) = TRIM(COALESCE((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'article'),(SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'article_title'),SPLIT((SELECT value.string_value FROM UNNEST(event_params) WHERE event_name = 'page_view' AND key = 'page_title' and value.string_value like '% - Articles - %'),' - Articles - ')[SAFE_OFFSET(0)])) AND ART._fivetran_deleted = FALSE
+LEFT JOIN `woe-system.postgres_rds_public.user_history_articles` AS ALS ON ART.id = ALS.article_id AND EV.auth_pseudo_user_id = CAST(ALS.user_id AS STRING) AND ALS._fivetran_deleted = FALSE
+LEFT JOIN `woe-system.tableau.tbl_recording_lookup` AS RL ON CAST(COALESCE((SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'recording_id'),CAST((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'recording_id') AS INT)) AS INT) = RL.recording_id AND event_name IN ('launched_recorded_video', 'recording_play_click')
+LEFT JOIN `woe-system.postgres_rds_public.user_history_recordings` AS RLS ON RL.recording_id = RLS.recording_id AND EV.auth_pseudo_user_id = CAST(RLS.user_id AS STRING) AND RLS._fivetran_deleted = FALSE)
+WHERE event_name IN ('article view', 'recording played')
+AND DATE(event_date) >= '2022-04-27' AND DATE(event_date) <= '2023-03-17'
+UNION ALL
+SELECT CAST(user_id AS STRING) AS user_id, NULL AS ga_session_id, email, company_name, "recording played" AS event_name, "recording" AS content_type, NULL AS event_platform, RL.name AS content_name,  date(created_at) AS event_date, RL.pillar_id, RL.teacher_name, RL.service_name, RL.service_name_2, RL.class_length, RL.session_instance_id, RL.session_date, progress_percentage, GENERATE_UUID() AS event_id
+FROM 
+  (SELECT DISTINCT DATETIME_TRUNC(DATE_ADD(created_at, INTERVAL 30 MINUTE), HOUR) AS created_at, MAX(is_played) AS is_played, MAX(is_watched) AS is_watched, MAX(progress_percentage) AS progress_percentage, recording_id, user_id, 
+  FROM `woe-system.postgres_rds_public.user_history_recordings` 
+  WHERE _fivetran_deleted = FALSE AND is_played = TRUE AND DATE(created_at) > '2023-03-17'
+  GROUP BY 1, recording_id, user_id) AS RH 
+LEFT JOIN `woe-system.tableau.tbl_tab_user_table` ON CAST(user_id AS STRING) = auth_pseudo_user_id
+LEFT JOIN `woe-system.tableau.tbl_recording_lookup` AS RL ON RH.recording_id = RL.recording_id
+UNION ALL
+SELECT CAST(user_id AS STRING) AS user_id, NULL AS ga_session_id, email, company_name, "article view" AS event_name, "article" AS content_type, NULL as event_platform, PA.title AS content_name, date(AH.created_at) AS event_date, PA.pillar_id, PA.author, NULL, NULL, NULL, NULL, NULL, progress_percentage, GENERATE_UUID() AS event_id
+FROM 
+  (SELECT DISTINCT DATETIME_TRUNC(created_at, day) AS created_at, MAX(is_read) AS is_read, MAX(progress_percentage) AS progress_percentage, article_id, user_id 
+  FROM `woe-system.postgres_rds_public.user_history_articles`
+  WHERE _fivetran_deleted = FALSE AND progress_percentage > 0 AND DATE(created_at) > '2023-03-17'
+  GROUP BY 1, article_id, user_id) AS AH
+LEFT JOIN `woe-system.tableau.tbl_tab_user_table` ON CAST(user_id AS STRING) = auth_pseudo_user_id
+LEFT JOIN `woe-system.postgres_rds_public.plan_article` AS PA ON article_id = PA.id)
+ORDER BY 1 ASC;
+
+
+-- VISIT
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_events_visits`; 
+CREATE TABLE `woe-system.tableau.tbl_events_visits` AS
+SELECT *,
+GENERATE_UUID() AS event_id
+FROM 
+(SELECT 
+DISTINCT
+EV.auth_pseudo_user_id,
+(SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS ga_session_id,
+UT.email,                    
+UT.company_name,
+CASE WHEN event_name = 'session_start' OR event_name =  'user_engagement' OR REGEXP_CONTAINS(event_name, '(view|click|impression)') OR page_name IS NOT NULL THEN 'logged in' END AS event_name,
+EV.platform AS event_platform,
+MIN(PARSE_DATE("%Y%m%d", event_date)) AS event_date,
+MAX(visit_length_minutes) AS visit_length_minutes
+FROM `woe-system.tableau.events_user_id_rework` AS EV
+LEFT JOIN `woe-system.tableau.tbl_tab_user_table` AS UT ON EV.auth_pseudo_user_id = UT.auth_pseudo_user_id
+WHERE CASE WHEN event_name = 'session_start' OR event_name =  'user_engagement' OR REGEXP_CONTAINS(event_name, '(view|click|impression)') OR page_name IS NOT NULL THEN 'logged in' END = 'logged in'
+GROUP BY 1,2,3,4,5,6)
+ORDER BY 1 ASC;
+
+
+-- SELECT * FROM  `woe-system.tableau.tbl_events_visits` where ga_session_id = 1678192776
+
+--         SELECT * FROM (SELECT (SELECT value.int_value FROM UNNEST(event_params) WHERE key ='ga_session_id') as ga_session_id,
+--                                 ROUND(CAST((TIMESTAMP_DIFF(max(timestamp_micros(event_timestamp)), min(timestamp_micros(event_timestamp)), second)/60)*1.00 AS FLOAT64),2) AS visit_length_minutes
+--                                 FROM `woe-system.analytics_249627001.events_*` 
+--                                 group by 1
+--                                 HAVING TIMESTAMP_DIFF(max(timestamp_micros(event_timestamp)), min(timestamp_micros(event_timestamp)), second) >= 1)     
+--                                 where ga_session_id = 1678192776
+
+
+-- PAGE VIEWS
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_events_page_views`; 
+CREATE TABLE `woe-system.tableau.tbl_events_page_views` AS
+SELECT *,
+GENERATE_UUID() AS event_id
+FROM 
+(SELECT 
+DISTINCT
+EV.auth_pseudo_user_id,
+(SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS ga_session_id,
+UT.email,                    
+UT.company_name,
+CASE WHEN page_name IS NOT NULL THEN 'page view' END AS event_name,
+page_name,
+app_info.version as app_info_version,
+EV.platform AS event_platform,
+PARSE_DATE("%Y%m%d", event_date) AS event_date,
+event_timestamp
+FROM `woe-system.tableau.events_user_id_rework` AS EV
+LEFT JOIN `woe-system.tableau.tbl_tab_user_table` AS UT ON EV.auth_pseudo_user_id = UT.auth_pseudo_user_id
+WHERE CASE WHEN page_name IS NOT NULL THEN 'page_view' END = 'page_view'
+AND event_name IN ("screen_view", "page_view")
+)
+ORDER BY 1 ASC;
+
+--INDEX
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_index`; 
+CREATE TABLE `woe-system.tableau.tbl_index` AS
+WITH `cte_index_row_order` AS 
+        (SELECT ROW_NUMBER() OVER (PARTITION BY EXA.student_id ORDER BY created_at ASC) AS row_order, EXA.student_id, created_at, GENERATE_UUID() AS join_id
+        FROM (SELECT * FROM `woe-system.postgres_rds_public.external_assessment_externalassessment` WHERE _fivetran_deleted = FALSE) AS EXA ORDER BY EXA.student_id),
+          `cte_index_to_from` AS 
+            (SELECT FD.row_order, FD.student_id, FD.created_at, DATE(FD.created_at) AS from_date, 
+            CASE WHEN DATE(FD.created_at) = DATE(TD.created_at) THEN DATE(TD.created_at) ELSE DATE(DATE_ADD(TD.created_at, INTERVAL -1 DAY)) END AS to_date
+            FROM `cte_index_row_order` AS FD
+            LEFT JOIN `cte_index_row_order` AS TD ON FD.student_id = TD.student_id AND FD.row_order+1 = TD.row_order                                           
+            ORDER BY 2,1),
+              `cte_index_to_from_main_table_join` AS
+                (SELECT EXA.*, TFD.from_date, TFD.to_date FROM (SELECT * FROM `woe-system.postgres_rds_public.external_assessment_externalassessment` WHERE _fivetran_deleted = FALSE) AS EXA
+                LEFT JOIN `cte_index_to_from` TFD ON EXA.created_at = TFD.created_at AND EXA.student_id = TFD.student_id)
+SELECT *, GENERATE_UUID() AS event_id
+FROM
+(SELECT
+DISTINCT
+UT.auth_pseudo_user_id,
+EXA.student_id,
+UT.email,                    
+UT.company_name,
+CASE WHEN DATE(EXA.created_at) = day THEN 'index complete' ELSE NULL END AS event_name,
+CASE WHEN DATE(EXA.created_at) <> day THEN 'index carry over' ELSE 'index complete' END AS index_carry_over_flag,
+COALESCE(day,CAST(EXA.created_at AS DATE)) AS event_date,
+DATE(EXA.created_at) AS index_event_date,
+'index' AS pillar_id,
+'index' AS service_name,
+'index' AS service_name_2,
+'index' AS content_name,
+'index' AS content_type,
+EXA.energy_intention, 
+EXA.energy_score,
+EXA.energy_score_percentage,
+EXA.nutrition_intention,
+EXA.nutrition_score,
+EXA.nutrition_score_percentage,
+EXA.resilience_intention, 
+EXA.resilience_score,
+EXA.resilience_score_percentage
+FROM `woe-system.tableau.tbl_user_active_over_time` AS UT 
+LEFT JOIN `cte_index_to_from_main_table_join` EXA ON UT.student_id = EXA.student_id AND UT.day BETWEEN EXA.from_date AND CASE WHEN EXA.to_date IS NULL THEN DATE(CURRENT_DATE) ELSE EXA.to_date END
+WHERE EXA.created_at IS NOT NULL)
+ORDER BY auth_pseudo_user_id, event_date;
+
+--CREATES USER VS SESSION CROSS REFERENCE TIMEZONE TABLE
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_user_session_timezone_crossref_table`;
+CREATE TABLE `woe-system.tableau.tbl_user_session_timezone_crossref_table` AS
+WITH `cte_session_id_time` AS 
+(select ID AS session_instance_id, group_session_id, instance_start_date_time, instance_display_end_date_time from `woe-system.postgres_rds_public.class_sessions_groupsessioninstance` WHERE _fivetran_deleted = FALSE)
+SELECT * FROM
+(SELECT 
+session_instance_id,
+auth_pseudo_user_id,
+CAST(DATETIME(instance_start_date_time ,timezone) AS TIME) AS session_local_start_time,
+CAST(DATETIME(instance_display_end_date_time ,timezone) AS TIME) AS session_local_end_time,
+instance_display_end_date_time,
+CASE WHEN 
+  (CASE WHEN is_active = TRUE
+    AND CAST(instance_start_date_time AS timestamp) >= CAST(date_joined AS timestamp) 
+      THEN 1 
+        ELSE CASE WHEN deactivated_date IS NOT NULL 
+          AND CAST(instance_start_date_time AS timestamp)  >= CAST(date_joined AS timestamp) 
+            AND CAST(instance_start_date_time AS timestamp)  <= CAST(deactivated_date AS timestamp) 
+              THEN 1 ELSE 0 END END ) = 1
+                AND 
+                  (CASE WHEN CAST(DATETIME(instance_start_date_time ,timezone) AS TIME) >= CAST('07:30:00' AS TIME)
+                    AND CAST(DATETIME(instance_display_end_date_time ,timezone) AS TIME) <= CAST('20:30:00' AS TIME)
+                      THEN 1 ELSE 0 END) = 1
+                        THEN 1 ELSE 0 END AS eligible_and_active
+FROM `cte_session_id_time` AS SIDT
+CROSS JOIN `woe-system.tableau.tbl_tab_user_table` AS AUT 
+LEFT JOIN `woe-system.postgres_rds_public.class_sessions_groupsession` AS CSG ON SIDT.group_session_id = CSG.ID AND CSG._fivetran_deleted = FALSE
+LEFT JOIN `woe-system.postgres_rds_public.companies_corporatecompany` AS CCC ON CSG.corporate_company_id = CCC.ID AND CCC._fivetran_deleted = FALSE
+WHERE
+CAST(instance_start_date_time AS DATE) >= CAST('2022-02-28' AS DATE)
+AND CAST(instance_start_date_time AS DATE) <= CAST(CURRENT_DATE AS DATE)
+AND (UPPER(group_session_for) = 'COMMUNITY' OR (UPPER(group_session_for) = 'CORPORATE' AND LOWER(company_name) = LOWER(ccc.name))) -- REMOVE RECORDING ONLY PLACEHOLDER SESSIONS
+ORDER BY 1 DESC)
+WHERE eligible_and_active = 1;
+
+
+--LIVE
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_live_session`; 
+CREATE TABLE `woe-system.tableau.tbl_live_session` AS
+WITH `session_joining_manual_combined` AS (
+  SELECT 
+  CAST(CSGSPJ.user_id AS STRING) AS auth_pseudo_user_id,
+  CSGSPJ.group_session_instance_id,
+  CSGSPJ.updated_at AS event_timestamp, 
+  UPPER(CSGSPJ.session_joining_platform) AS session_joining_platform, 
+  UPPER(CSGSPJ.session_registration_platform) AS session_registration_platform,
+  'joined' AS row_name_flag
+  FROM (SELECT * FROM `woe-system.postgres_rds_public.class_sessions_groupsessionpeoplejoining` WHERE _fivetran_deleted = FALSE AND session_joining_platform IS NOT NULL) AS CSGSPJ
+  WHERE session_joining_platform IS NOT NULL
+  AND DATE(CSGSPJ.updated_at) >= '2022-05-01'
+      UNION ALL
+      SELECT 
+      CAST(CSGSPJ.user_id AS STRING) AS auth_pseudo_user_id,
+      CSGSPJ.group_session_instance_id,
+      CSGSPJ.created_at, 
+      NULL AS session_joining_platform, 
+      UPPER(CSGSPJ.session_registration_platform) AS session_registration_platform,
+      'registered' AS row_name_flag
+      FROM (SELECT * FROM `woe-system.postgres_rds_public.class_sessions_groupsessionpeoplejoining` WHERE _fivetran_deleted = FALSE AND session_registration_platform IS NOT NULL) AS CSGSPJ
+      WHERE session_registration_platform IS NOT NULL 
+      AND DATE(CSGSPJ.created_at) >= '2022-05-01'
+        UNION ALL
+          SELECT
+          CAST(MED.user_id AS STRING),
+          MED.group_session_instance_id,
+          CAST(CSGI.instance_display_end_date_time AS TIMESTAMP) AS updated_at, 
+          MED.session_joining_platform, 
+          NULL AS session_registration_platform,
+          'joined' AS row_name_flag
+          FROM `woe-system.google_drive.manual_engagement_data_input_sheet_1` AS MED
+          LEFT JOIN (SELECT * FROM `woe-system.postgres_rds_public.class_sessions_groupsessioninstance` WHERE _fivetran_deleted = FALSE) AS CSGI ON MED.group_session_instance_id = CSGI.ID
+            UNION ALL
+              SELECT 
+              auth_pseudo_user_id,
+              session_instance_id,
+              CAST(instance_display_end_date_time AS TIMESTAMP) AS updated_at,
+              NULL AS session_joining_platform,
+              NULL AS session_registration_platform, 
+              'eligible' AS row_name_flag
+              FROM `woe-system.tableau.tbl_user_session_timezone_crossref_table`)
+                    SELECT
+                    DISTINCT
+                      CSGSPJ.auth_pseudo_user_id,
+                      CASE WHEN row_name_flag = 'eligible' THEN CSGSPJ.auth_pseudo_user_id ELSE NULL END AS eligible_user_id,
+                      event_timestamp,
+                      CAST(DATETIME(event_timestamp,UT.timezone) AS TIME) AS session_local_start_time,
+                      CASE WHEN row_name_flag = 'joined' THEN session_joining_platform WHEN row_name_flag = 'registered' THEN session_registration_platform END AS event_platform,
+                      session_registration_platform,
+                      CSGSPJ.group_session_instance_id AS session_instance_id,
+                      CSG.id AS group_session_id,
+                      group_session_for,
+                      CASE WHEN row_name_flag = 'joined' THEN CONCAT('joined ',lower(group_session_for), ' session') 
+                        ELSE CASE WHEN row_name_flag = 'registered' THEN CONCAT('registered ',lower(group_session_for), ' session') ELSE NULL END END AS event_name,
+                      row_name_flag,
+                      CSG.name AS content_name,
+                      CAST(CSGI.instance_display_end_date_time AS DATE) AS event_date,
+                      CSG.pillar_id,
+                      CS.name AS service_name,
+                      CC.name as service_name_2,
+                      CONCAT(EXTRACT(YEAR FROM CSGI.instance_display_end_date_time),'_',format("%02d",EXTRACT(MONTH FROM CSGI.instance_display_end_date_time))) AS yyyy_mm,
+                      TD.ID As teacher_id,
+                      CONCAT(AU.first_name,' ',AU.last_name) AS teacher_name,
+          RIGHT(LEFT(CAST(DATETIME(CSGI.INSTANCE_START_DATE_TIME, 'Europe/London') as STRING),16),5) as class_time,
+                      CASE WHEN CSG.NAME = '5 Minute Breathwork' THEN 5 ELSE TIMESTAMP_DIFF(CSGI.instance_display_end_date_time, CSGI.instance_start_date_time, MINUTE) END AS class_length,
+                      CSG.NAME AS class_name,
+                      "live" AS content_type,
+                      CONCAT('live_',CSG.NAME,'(ID:',CSGI.id,')') AS content_type_name_instance_id,
+                      CONCAT('live_',CSG.NAME,'(ID:',CSG.id,')') AS content_type_name_group_session_id,
+                      progress_percentage,
+                      (progress_percentage/100.0)*CASE WHEN CSG.NAME = '5 Minute Breathwork' THEN 5 ELSE TIMESTAMP_DIFF(CSGI.instance_display_end_date_time, CSGI.instance_start_date_time, MINUTE) END AS time_spent_in_live_session,
+                      GENERATE_UUID() AS event_id
+                    FROM (SELECT * FROM `woe-system.postgres_rds_public.class_sessions_groupsessioninstance` WHERE _fivetran_deleted = FALSE) AS CSGI
+                    LEFT JOIN `woe-system.postgres_rds_public.class_sessions_groupsession` AS CSG ON CSG.ID = CSGI.group_session_id AND CSG._fivetran_deleted = FALSE
+                    LEFT JOIN `woe-system.postgres_rds_public.teachers_teacherdetail` AS TD ON TD.ID = CSGI.TEACHER_ID AND TD._fivetran_deleted = FALSE
+                    LEFT JOIN `session_joining_manual_combined` AS CSGSPJ ON CSGSPJ.GROUP_SESSION_INSTANCE_ID = CSGI.ID
+                    LEFT JOIN `woe-system.tableau.tbl_roster_seats_and_employees` AS UT ON CSGSPJ.auth_pseudo_user_id = UT.auth_pseudo_user_id and CAST(CSGI.instance_display_end_date_time AS DATE) = UT.day
+                    LEFT JOIN `woe-system.postgres_rds_public.auth_user` AS AU ON TD.USERDETAIL_OBJ_ID = AU.id AND AU._fivetran_deleted = FALSE
+                    LEFT JOIN `woe-system.postgres_rds_public.classes_service` AS CS ON CS.ID = CSG.SERVICE_ID AND CS._fivetran_deleted = FALSE
+                    LEFT JOIN `woe-system.postgres_rds_public.classes_class` AS CC ON CSG.class_obj_id = cc.id AND CC._fivetran_deleted = FALSE
+                    LEFT JOIN `woe-system.postgres_rds_public.user_history_group_sessions` AS LSL ON CSGSPJ.group_session_instance_id = LSL.group_session_instance_id AND CSGSPJ.auth_pseudo_user_id = CAST(LSL.user_id AS STRING) AND LSL._fivetran_deleted = FALSE
+                    FULL JOIN `woe-system.tableau.tbl_user_session_timezone_crossref_table` AS EA ON CSGI.ID = EA.session_instance_id AND UT.auth_pseudo_user_id = EA.auth_pseudo_user_id
+                    WHERE 
+                    CAST(CSGI.instance_display_end_date_time AS DATE) IS NOT NULL 
+                    AND CAST(CSGI.instance_display_end_date_time AS DATE) <= CURRENT_DATE();
+
+-- PLACEHOLDER LIVE SESSIONS
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_placeholder_group_sessions`; 
+CREATE TABLE `woe-system.tableau.tbl_placeholder_group_sessions` AS
+SELECT * FROM `woe-system.postgres_rds_public.class_sessions_groupsessioninstance` 
+WHERE instance_start_date_time < created_at 
+AND _fivetran_deleted = FALSE 
+AND created_at > "2022-11-29"
+AND group_session_id NOT IN 
+  (SELECT group_session_id FROM (SELECT group_session_id, COUNT(*) AS engagement_count FROM `woe-system.tableau.tbl_live_session` WHERE row_name_flag = 'joined' OR row_name_flag = 'registered' GROUP BY 1 HAVING engagement_count > 0 ORDER BY 1 DESC))
+ORDER BY group_session_id;
+
+-- UPDATE LIVE TABLE
+DELETE FROM `woe-system.tableau.tbl_live_session`
+WHERE group_session_id IN 
+  (SELECT group_session_id FROM `woe-system.tableau.tbl_placeholder_group_sessions`);
+
+
+-- MOOD SCORES
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_feedback`; 
+CREATE TABLE `woe-system.tableau.tbl_feedback` AS
+SELECT 
+CAST(SF.created_at AS DATE) AS event_date,
+RIGHT(LEFT(CAST(DATETIME(CSGI.INSTANCE_START_DATE_TIME, 'Europe/London') as STRING),16),5) AS feedback_timestamp,
+"left feedback" AS event_name,
+CAST(SF.user_id AS STRING) AS auth_pseudo_user_id,
+SF.mood_before,
+SF.mood_after,
+SF.mood_after - sf.mood_before as mood_change,
+(SF.mood_after - SF.mood_before)* 20.0 as mood_change_perc_pts,
+SF.notes,
+SF.group_session_instance_id,
+CR.name AS class_rating,
+group_session_for,
+CSG.id AS group_session_id,
+CSG.name AS content_name,
+CSG.pillar_id,
+CS.name AS service_name,
+CC.name as service_name_2,
+TD.id As teacher_id,
+CONCAT(AU.first_name,' ',AU.last_name) AS teacher_name,
+RIGHT(LEFT(CAST(DATETIME(CSGI.INSTANCE_START_DATE_TIME, 'Europe/London') as STRING),16),5) as class_time,
+CASE WHEN CSG.NAME = '5 Minute Breathwork' THEN 5 ELSE TIMESTAMP_DIFF(CSGI.instance_display_end_date_time, CSGI.instance_start_date_time, MINUTE) END AS class_length,
+CSG.NAME AS class_name,
+GENERATE_UUID() AS event_id
+FROM (SELECT * FROM `woe-system.postgres_rds_public.feedbacks_sessionfeedback` WHERE _fivetran_deleted = FALSE) SF
+LEFT JOIN `woe-system.postgres_rds_public.feedbacks_classrating` AS CR ON SF.class_rating_id = CR.id AND CR._fivetran_deleted = FALSE
+LEFT JOIN `woe-system.postgres_rds_public.class_sessions_groupsessioninstance` AS CSGI ON CSGI.id = SF.group_session_instance_id AND CSGI._fivetran_deleted = FALSE
+LEFT JOIN `woe-system.postgres_rds_public.class_sessions_groupsession` AS CSG ON CSG.ID = CSGI.group_session_id AND CSG._fivetran_deleted = FALSE
+LEFT JOIN `woe-system.postgres_rds_public.teachers_teacherdetail` AS TD ON TD.ID = CSGI.TEACHER_ID AND TD._fivetran_deleted = FALSE
+LEFT JOIN `woe-system.postgres_rds_public.auth_user` AS AU ON TD.USERDETAIL_OBJ_ID = AU.id AND AU._fivetran_deleted = FALSE
+LEFT JOIN `woe-system.postgres_rds_public.classes_service` AS CS ON CS.ID = CSG.SERVICE_ID AND CS._fivetran_deleted = FALSE
+LEFT JOIN `woe-system.postgres_rds_public.classes_class` AS CC ON CSG.class_obj_id = cc.id AND CC._fivetran_deleted = FALSE;
+
+DROP TABLE IF EXISTS `woe-system.tableau.manual_on_demand_engagement_data`; 
+CREATE TABLE `woe-system.tableau.manual_on_demand_engagement_data` AS
+SELECT *, 
+CASE WHEN event_name like '%article%' THEN 'article'
+ WHEN event_name like '%recording%' THEN 'recording' ELSE NULL END AS content_type,
+GENERATE_UUID() AS event_id 
+FROM `woe-system.google_drive.pre_may_2022_manual_engagement_data_input_all_events` WHERE event_name IN ('recording played', 'article view');
+
+DROP TABLE IF EXISTS `woe-system.tableau.manual_live_engagement`; 
+CREATE TABLE `woe-system.tableau.manual_live_engagement` AS
+SELECT *,
+"live" AS content_type,
+GENERATE_UUID() AS event_id 
+FROM `woe-system.google_drive.pre_may_2022_manual_engagement_data_input_live`;
+
+
+
+
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_roster_seats_and_employees_reduced`; 
+CREATE TABLE `woe-system.tableau.tbl_roster_seats_and_employees_reduced` AS
+SELECT * FROM 
+(SELECT UT.*, CASE WHEN user_active_flag = TRUE THEN NULL 
+                ELSE CASE WHEN deactivated_date IS NOT NULL THEN deactivated_date 
+                  ELSE LEAST(DATE(termination_date),max_event_date) END END AS deactivated_date_rework 
+FROM `woe-system.tableau.tbl_roster_seats_and_employees` AS UT
+LEFT JOIN 
+  (SELECT auth_pseudo_user_id, MAX(event_date) as max_event_date
+  FROM
+    (SELECT event_date, auth_pseudo_user_id, event_id, "OD" AS data_source_id FROM `woe-system.tableau.tbl_events_on_demand`     
+    UNION ALL
+    SELECT event_date, auth_pseudo_user_id, event_id, "PV" AS data_source_id FROM `woe-system.tableau.tbl_events_page_views`
+    UNION ALL
+    SELECT event_date, auth_pseudo_user_id, event_id, "VI" AS data_source_id FROM `woe-system.tableau.tbl_events_visits`
+    UNION ALL
+    SELECT date, CAST(auth_pseudo_user_id AS STRING), event_id, "MOD" AS data_source_id FROM `woe-system.tableau.manual_on_demand_engagement_data`
+    UNION ALL
+    SELECT date, CAST(auth_pseudo_user_id AS STRING), event_id, "MLE" AS data_source_id FROM `woe-system.tableau.manual_live_engagement`
+    UNION ALL
+    SELECT event_date, auth_pseudo_user_id, event_id, "IDX" AS data_source_id  FROM `woe-system.tableau.tbl_index` where event_name = 'index complete'
+    UNION ALL
+    SELECT event_date, auth_pseudo_user_id, event_id, "FB" AS data_source_id FROM  `woe-system.tableau.tbl_feedback`
+    UNION ALL
+    SELECT event_date, auth_pseudo_user_id, event_id, "LE" AS data_source_id FROM `woe-system.tableau.tbl_live_session`)
+  GROUP BY 1) AS UN
+  ON UT.auth_pseudo_user_id = UN.auth_pseudo_user_id)
+WHERE (user_type <>  'Activated User' OR CASE WHEN user_active_flag = TRUE AND day >= DATE(date_joined) THEN 1
+    ELSE CASE WHEN user_active_flag = FALSE AND deactivated_date_rework IS NULL THEN 0 
+        ELSE CASE WHEN user_active_flag = FALSE AND day < deactivated_date_rework 
+            AND day >= DATE(date_joined) THEN 1 ELSE 0 END END END = 1);
+
+
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_unreported_visits`; 
+CREATE TABLE `woe-system.tableau.tbl_unreported_visits` AS
+SELECT *, GENERATE_UUID() AS event_id
+FROM (
+  select "logged in" as event_name, event_date, auth_pseudo_user_id, 
+  sum(case when event_name <> 'logged in' and event_name is not null then 1 else 0 end) as non_visit_events, 
+  sum(case when event_name = 'logged in' then 1 else 0 end) as visit_events
+  from 
+  (SELECT event_date, event_name,  auth_pseudo_user_id, event_id, "OD" AS data_source_id FROM `woe-system.tableau.tbl_events_on_demand`     
+    UNION ALL
+    SELECT event_date, event_name,  auth_pseudo_user_id, event_id, "PV" AS data_source_id FROM `woe-system.tableau.tbl_events_page_views`
+    UNION ALL
+    SELECT event_date, event_name, auth_pseudo_user_id, event_id, "VI" AS data_source_id FROM `woe-system.tableau.tbl_events_visits`
+    UNION ALL
+    SELECT date, event_name, CAST(auth_pseudo_user_id AS STRING), event_id, "MOD" AS data_source_id FROM `woe-system.tableau.manual_on_demand_engagement_data`
+    UNION ALL
+    SELECT date, event_name, CAST(auth_pseudo_user_id AS STRING), event_id, "MLE" AS data_source_id FROM `woe-system.tableau.manual_live_engagement`
+    UNION ALL
+    SELECT event_date, event_name, auth_pseudo_user_id, event_id, "IDX" AS data_source_id  FROM `woe-system.tableau.tbl_index`
+    UNION ALL
+    SELECT event_date, event_name, auth_pseudo_user_id, event_id, "FB" AS data_source_id FROM  `woe-system.tableau.tbl_feedback`
+    UNION ALL
+    SELECT event_date, event_name,  auth_pseudo_user_id, event_id, "LE" AS data_source_id FROM `woe-system.tableau.tbl_live_session`
+    UNION ALL
+    SELECT DATE(last_login), "login", CAST(id as STRING), null, "LI" AS data_source_id FROM `woe-system.postgres_rds_public.auth_user` where _fivetran_deleted = FALSE AND last_login IS NOT NULL
+     )
+  group by 1,2,3
+  having non_visit_events > 0 and visit_events = 0)
+  order by 1,2 asc;
+
+
+-- ALL ENG PLUS EMPTY SESSIONS --
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_all_eng_events_all_users` ; 
+CREATE TABLE `woe-system.tableau.tbl_all_eng_events_all_users` AS
+SELECT *,
+MIN(CASE WHEN event_name = 'logged in' THEN date ELSE NULL END) OVER (PARTITION BY activated_user_id) AS first_login,
+CASE WHEN event_name = 'logged in' AND date = MIN(CASE WHEN event_name = 'logged in' THEN date ELSE NULL END) OVER (PARTITION BY activated_user_id) THEN activated_user_id ELSE NULL END AS first_login_flag,
+CASE WHEN MIN(CASE WHEN event_name = 'logged in' THEN date ELSE NULL END) OVER (PARTITION BY activated_user_id) IS NOT NULL THEN "Yes" ELSE "No" END AS logged_in_flag,
+CONCAT(CAST(REPLACE(CAST(date AS STRING),"-","") AS INT64),ROW_NUMBER() OVER (PARTITION BY auth_pseudo_user_id ORDER BY date asc, event_name asc)) AS event_order_id,
+CASE WHEN MCI.session_id IS NOT NULL THEN 1 ELSE NULL END AS manual_calendar_flag
+FROM
+(SELECT
+DISTINCT
+UN.event_date as date,
+CASE WHEN COALESCE(EV.event_name,PV.event_name,VI.event_name,UNVI.event_name,IDX.event_name,LE.event_name,FB.event_name,MOD.event_name,MLE.event_name) IS NOT NULL THEN UN.event_date ELSE NULL END AS event_only_date,
+EV.session_date,
+COALESCE(EV.ga_session_id,PV.ga_session_id,VI.ga_session_id) AS ga_session_id,
+CONCAT(FORMAT("%02d",EXTRACT(MONTH FROM UN.event_date)), " ", EXTRACT(YEAR FROM UN.event_date)) AS month,
+EXTRACT(YEAR FROM UN.event_date) AS year,
+UN.event_id,
+COALESCE(EV.event_name,PV.event_name,VI.event_name,UNVI.event_name,IDX.event_name,LE.event_name,FB.event_name,MOD.event_name,MLE.event_name) AS event_name,
+CASE WHEN COALESCE(EV.event_name,PV.event_name,VI.event_name,UNVI.event_name,IDX.event_name,LE.event_name,FB.event_name,MOD.event_name,MLE.event_name) IN ('recording played','article view') THEN 'on demand'
+  ELSE CASE WHEN COALESCE(EV.event_name,PV.event_name,VI.event_name,UNVI.event_name,IDX.event_name,LE.event_name,FB.event_name,MOD.event_name,MLE.event_name) IN ('registered community session','registered corporate session') THEN 'registered'
+    ELSE CASE WHEN COALESCE(EV.event_name,PV.event_name,VI.event_name,UNVI.event_name,IDX.event_name,LE.event_name,FB.event_name,MOD.event_name,MLE.event_name) IN ('joined community session','joined corporate session') THEN 'joined live session'
+      ELSE COALESCE(EV.event_name,PV.event_name,VI.event_name,UNVI.event_name,IDX.event_name,LE.event_name,FB.event_name,MOD.event_name,MLE.event_name) 
+        END END END event_name_category,
+IDX.index_carry_over_flag,
+LE.row_name_flag,
+UN.data_source_id,
+CASE WHEN UPPER(COALESCE(EV.event_platform,PV.event_platform,VI.event_platform,LE.event_platform,MOD.event_platform,MLE.event_platform)) LIKE "%APP%" THEN "WEB-APP" ELSE 
+  UPPER(COALESCE(EV.event_platform,PV.event_platform,VI.event_platform,LE.event_platform,MOD.event_platform,MLE.event_platform)) END AS event_platform,
+LE.session_registration_platform,
+`woe-system.common_functions.InitCapIfAllCaps`(TRIM(COALESCE(EV.content_name,IDX.content_name,LE.content_name,FB.content_name,MOD.content_name,MLE.content_name,EV.event_name,VI.event_name,UNVI.event_name))) AS content_name,
+page_name,
+app_info_version,
+COALESCE(EV.pillar_id,IDX.pillar_id,LE.pillar_id,FB.pillar_id) AS pillar_id,
+COALESCE(EV.service_name,IDX.service_name,LE.service_name,FB.service_name) AS service_name,
+COALESCE(EV.service_name_2,IDX.service_name_2,LE.service_name_2,FB.service_name_2) AS service_name_2,
+COALESCE(EV.practitioner,LE.teacher_name) AS practitioner,
+COALESCE(EV.progress_percentage,LE.progress_percentage) AS content_progress,
+UN.auth_pseudo_user_id AS auth_pseudo_user_id,
+CASE WHEN user_type = 'Activated User' THEN UN.auth_pseudo_user_id ELSE NULL END AS activated_user_id,
+CASE WHEN COALESCE(EV.event_name,PV.event_name,VI.event_name,UNVI.event_name,IDX.event_name,LE.event_name,FB.event_name,MOD.event_name,MLE.event_name) IS NOT NULL AND user_type = 'Activated User' THEN UN.auth_pseudo_user_id ELSE NULL END AS activated_event_id,
+CASE WHEN COALESCE(EV.event_name,PV.event_name,VI.event_name,UNVI.event_name,IDX.event_name,LE.event_name,FB.event_name,MOD.event_name,MLE.event_name) IS NOT NULL THEN UN.auth_pseudo_user_id ELSE NULL END AS all_user_event_id,  
+LE.eligible_user_id,
+DS.day_of_week,
+CASE WHEN company_roster < 10 THEN 'Micro: <10' 
+  ELSE CASE WHEN company_roster < 50 THEN 'Small: <50' 
+     ELSE CASE WHEN company_roster < 250 THEN 'Medium: <250' 
+       ELSE CASE WHEN company_roster < 1000 THEN 'Large: <1000' 
+         ELSE CASE WHEN company_roster >= 1000 THEN 'Enterprise: >=1000' 
+          END END END END END AS company_size,
+CI.client_tag,
+CI.active_flag AS client_active_flag,
+UT.email,
+UT.first_name,
+UT.last_name,
+UT.user_active_flag,
+UT.deactivated_date_rework,
+UT.date_joined,
+UT.company_name,
+DATE_DIFF(UN.event_date, DATE(UT.kick_off_date), DAY) AS days_since_kick_off,
+UT.kick_off_date,
+UT.termination_date,
+UT.core_clients,
+UT.client_type,
+UT.reporting_flag,
+UT.active_flag as company_active_flag,
+UT.timezone,
+CONCAT(LEFT(CONCAT('GMT', REGEXP_EXTRACT(FORMAT_TIMESTAMP('%z', CURRENT_TIMESTAMP(), UT.timezone), r'([+-]\d+)')),6),":",RIGHT(CONCAT('GMT', REGEXP_EXTRACT(FORMAT_TIMESTAMP('%z', CURRENT_TIMESTAMP(), UT.timezone), r'([+-]\d+)')),2)) AS timezone_gmt,
+UT.user_modal_platform,
+CASE WHEN UN.auth_pseudo_user_id IS NOT NULL AND UT.user_type IS NULL THEN 'Unknown User' ELSE UT.user_type END AS user_type,
+UD.last_login,
+VI.visit_length_minutes,
+(IDX.energy_score_percentage+IDX.nutrition_score_percentage+IDX.resilience_score_percentage)/3 AS average_index_score,
+IDX.energy_intention,
+IDX.energy_score,
+IDX.energy_score_percentage,
+IDX.nutrition_intention,
+IDX.nutrition_score,
+IDX.nutrition_score_percentage,
+IDX.resilience_intention,
+IDX.resilience_score,
+IDX.resilience_score_percentage,
+LE.class_time,
+CONCAT(DS.day_of_week," ",COALESCE(LE.class_time,FB.class_time)) AS day_of_week_time,
+COALESCE(EV.class_length,LE.class_length,FB.class_length) AS class_length,
+COALESCE(LE.class_name,FB.class_name) AS class_name,
+COALESCE(LE.content_type,EV.content_type,IDX.content_type,MOD.content_type,MLE.content_type) AS content_type,
+LE.content_type_name_instance_id,
+LE.content_type_name_group_session_id,
+LE.session_local_start_time,
+COALESCE(EV.session_instance_id, LE.session_instance_id,FB.group_session_instance_id) AS session_instance_id,
+COALESCE(LE.group_session_id,FB.group_session_id) AS group_session_id,
+LEFT(LOWER(COALESCE(LE.group_session_for,FB.group_session_for)),4) AS group_session_for,
+CASE WHEN LE.time_spent_in_live_session < 0 THEN NULL ELSE LE.time_spent_in_live_session END AS time_spent_in_live_session,
+FB.mood_before,
+FB.mood_after,
+FB.mood_after - FB.mood_before as mood_change,
+(FB.mood_after - FB.mood_before)* 20.0 as mood_change_perc_pts,
+FB.feedback_timestamp,
+FB.notes,
+FB.class_rating
+FROM (SELECT event_date, auth_pseudo_user_id, event_id, "OD" AS data_source_id FROM `woe-system.tableau.tbl_events_on_demand`
+          UNION ALL
+          SELECT event_date, auth_pseudo_user_id, event_id, "PV" AS data_source_id FROM `woe-system.tableau.tbl_events_page_views`
+          UNION ALL
+          SELECT event_date, auth_pseudo_user_id, event_id, "VI" AS data_source_id FROM `woe-system.tableau.tbl_events_visits`
+          UNION ALL
+          SELECT date, CAST(auth_pseudo_user_id AS STRING), event_id, "MOD" AS data_source_id FROM `woe-system.tableau.manual_on_demand_engagement_data`
+          UNION ALL
+          SELECT date, CAST(auth_pseudo_user_id AS STRING), event_id, "MLE" AS data_source_id FROM `woe-system.tableau.manual_live_engagement`
+          UNION ALL
+          SELECT event_date, auth_pseudo_user_id, event_id, "IDX" AS data_source_id  FROM `woe-system.tableau.tbl_index`
+          UNION ALL
+          SELECT event_date, auth_pseudo_user_id, event_id, "FB" AS data_source_id FROM  `woe-system.tableau.tbl_feedback`
+          UNION ALL
+          SELECT event_date, auth_pseudo_user_id, event_id, "LE" AS data_source_id FROM `woe-system.tableau.tbl_live_session`
+          UNION ALL
+          SELECT event_date, auth_pseudo_user_id, event_id, "UNVI" AS data_source_id FROM `woe-system.tableau.tbl_unreported_visits`
+          UNION ALL
+          SELECT day, auth_pseudo_user_id,  event_id, "UT" AS data_source_id FROM `woe-system.tableau.tbl_roster_seats_and_employees_reduced`) AS UN 
+LEFT JOIN (SELECT auth_pseudo_user_id, first_name, last_name, email,user_active_flag,company_name,kick_off_date,termination_date,core_clients,deactivated_date_rework,date_joined,client_type,reporting_flag,active_flag,timezone,user_modal_platform,user_type
+          FROM `woe-system.tableau.tbl_roster_seats_and_employees_reduced`) AS UT ON UN.auth_pseudo_user_id = UT.auth_pseudo_user_id   
+LEFT JOIN `woe-system.tableau.tbl_tab_user_table` AS UD ON UN.auth_pseudo_user_id = UD.auth_pseudo_user_id            
+LEFT JOIN `woe-system.tableau.tbl_events_on_demand` AS EV ON UN.event_id = EV.event_id
+LEFT JOIN `woe-system.tableau.manual_on_demand_engagement_data` AS MOD ON UN.event_id = MOD.event_id
+LEFT JOIN `woe-system.tableau.manual_live_engagement` AS MLE ON UN.event_id = MLE.event_id
+LEFT JOIN `woe-system.tableau.tbl_events_page_views` AS PV ON UN.event_id = PV.event_id
+LEFT JOIN `woe-system.tableau.tbl_events_visits` AS VI ON UN.event_id = VI.event_id
+LEFT JOIN `woe-system.tableau.tbl_unreported_visits` AS UNVI ON UN.event_id = UNVI.event_id
+LEFT JOIN `woe-system.tableau.tbl_index` AS IDX ON UN.event_id = IDX.event_id
+LEFT JOIN `woe-system.tableau.tbl_live_session` AS LE ON UN.event_id = LE.event_id
+LEFT JOIN `woe-system.tableau.tbl_feedback` AS FB ON UN.event_id = FB.event_id
+LEFT JOIN (SELECT company_name, COUNT(DISTINCT auth_pseudo_user_id) AS company_roster FROM `woe-system.tableau.tbl_roster_seats_and_employees_reduced` WHERE user_active_flag = TRUE GROUP BY 1) AS CC ON UT.company_name = CC.company_name 
+FULL JOIN `woe-system.tableau.date_scaffold` AS DS ON UN.event_date = DS.day
+INNER JOIN `woe-system.google_drive.commercial_info_client_start_end` AS CI ON UT.company_name = CI.company_name
+)
+LEFT JOIN (SELECT session_id FROM `woe-system.google_drive.manual_calendar_invites_logs`) AS MCI ON session_instance_id = session_id
+WHERE (UPPER(content_name) NOT LIKE '%TEST%' OR content_name IS NULL)
+AND (DATE(date) >= DATE(kick_off_date) OR kick_off_date IS NULL)
+AND (DATE(date) <= DATE(termination_date) OR termination_date IS NULL)
+AND (CASE WHEN LOWER(company_name) like '%howard%' AND LOWER(email) NOT LIKE '%@brevanhoward%' AND LOWER(email) NOT LIKE '%@alanhoward%' THEN 0 ELSE 1 END = 1)
+AND (user_type <>  'Activated User' OR CASE WHEN user_active_flag = TRUE AND date >= DATE(date_joined) THEN 1
+    ELSE CASE WHEN user_active_flag = FALSE AND deactivated_date_rework IS NULL THEN 0 
+        ELSE CASE WHEN user_active_flag = FALSE AND date < deactivated_date_rework 
+            AND date >= DATE(date_joined) THEN 1 ELSE 0 END END END = 1);
+UPDATE `woe-system.tableau.tbl_all_eng_events_all_users`
+SET class_length = 
+  CASE 
+    WHEN LOWER(content_name) = LOWER('In person BGC Massage sessions') THEN 10
+    WHEN LOWER(content_name) = LOWER('In person BGC Nutrition Sessions') THEN 15
+    ELSE class_length  -- Keep the existing value if content_name does not match
+  END
+WHERE 
+  LOWER(content_name) IN (LOWER('In person BGC Massage sessions'), LOWER('In person BGC Nutrition Sessions'));
+
+-- USER FUNNEL --
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_user_behaviour_funnel` ; 
+CREATE TABLE `woe-system.tableau.tbl_user_behaviour_funnel` AS
+SELECT DISTINCT company_name, activated_user_id, date, event_name, event_name_category, date_joined, data_source_id, ga_session_id, content_name, 
+IF(date = date_joined AND data_source_id = 'UT', 'date_joined', IF(date = first_login AND event_name = 'logged in', 'first_login', event_name)) as event_name_v2,
+IF(event_name_category IN ('on demand', 'joined live session', 'index complete'), "Yes", NULL) AS engagement_action_flag,
+IF(date = 
+  MIN(IF(event_name_category IN ('on demand', 'joined live session', 'index complete'), date, NULL)) OVER (PARTITION BY activated_user_id) -- ONLY RUN MIN AGAINST DATES WHERE ENGAGEMENT ACTIONS
+    AND event_name_category IN ('on demand', 'joined live session', 'index complete'), "Yes", NULL) AS first_engagement_flag
+FROM `woe-system.tableau.tbl_all_eng_events_all_users` 
+WHERE activated_user_id IS NOT NULL
+AND (IF(date = date_joined AND data_source_id = 'UT', 'date_joined', IF(date = first_login AND event_name = 'logged in', 'first_login', event_name)) IN ('first_login', 'date_joined', 'logged in')
+OR event_name_category IN ('on demand', 'joined live session', 'index complete'))
+AND company_name NOT IN ('Walking on Earth', 'WONE Friends & Family', 'Vahani')
+AND date_joined >= '2022-06-01' AND date >= '2022-06-01'
+ORDER BY 1,2 ASC;
+
+
+DROP TABLE IF EXISTS `woe-system.prod_analytics.autostore_signed_up` ; 
+CREATE TABLE `woe-system.prod_analytics.autostore_signed_up` AS
+SELECT distinct email FROM  `woe-system.tableau.tbl_all_eng_events_all_users` 
+WHERE company_name = 'Autostore' AND email IS NOT NULL;
+
+DROP TABLE IF EXISTS `woe-system.tableau.tbl_keyword_analysis`; 
+CREATE TABLE `woe-system.tableau.tbl_keyword_analysis` AS
+WITH stop_words AS (
+  SELECT word
+  FROM UNNEST(['a', 'an', 'the', 'of', 'is', 'and', 'or', 'but', 'if', 'in', 'on', 'at', 'for', 'with', 'to', 'from', 'by', 'as', 'it']) AS word
+)
+SELECT DISTINCT date,  session_date, company_name, event_name, event_name_category, session_instance_id, content_name, word_array AS keyword, eligible_user_id, activated_event_id, logged_in_flag, content_type, group_session_for,event_id
+FROM `woe-system.tableau.tbl_all_eng_events_all_users` , UNNEST(SPLIT(content_name," ")) AS word_array 
+WHERE logged_in_flag = 'Yes'
+AND ((content_type = 'live' AND group_session_for = "comm") OR content_type = 'recording')
+and company_name NOT IN ('Walking on Earth', 'WONE Friends & Family')
+and (event_name_category = 'joined live session' OR event_name_category IS NULL OR event_name = 'recording played')
+AND LENGTH(word_array) > 3
+AND word_array NOT IN (SELECT word FROM stop_words)
+ORDER BY 1,2;
+
+-- CHECK LOGGED IN DATA 
+DROP TABLE IF EXISTS `woe-system.prod_analytics.send_nps` ; 
+CREATE TABLE `woe-system.prod_analytics.send_nps` AS
+SELECT UT.email,
+CASE WHEN MAX(date) > DATE_ADD(CURRENT_DATE(), INTERVAL -3 MONTH) THEN "Yes" ELSE "No" END AS send_NPS,
+CASE WHEN DATE(FORMAT_TIMESTAMP('%Y-%m-%d', PARSE_TIMESTAMP('%m/%d/%Y %H:%M:%S', MAX(submitted_at)))) >= DATE_ADD(CURRENT_DATE(), INTERVAL -30 DAY) THEN FALSE ELSE TRUE END AS send_email
+FROM `woe-system.tableau.tbl_all_eng_events_all_users` AS UT
+LEFT JOIN `woe-system.google_drive.nps_typeform_results_created_2023_06_07_nps_test_popup` AS TF ON UT.email = TF.email
+WHERE event_name = "logged in"
+AND user_active_flag IS TRUE
+AND first_login <= DATE_ADD(CURRENT_DATE(), INTERVAL -90 DAY)
+GROUP BY 1
+ORDER BY send_email ASC;
+
+
+DROP TABLE IF EXISTS `woe-system.prod_analytics.cantor_not_yet_logged_in` ; 
+CREATE TABLE `woe-system.prod_analytics.cantor_not_yet_logged_in` AS
+SELECT DISTINCT email 
+FROM `woe-system.tableau.tbl_all_eng_events_all_users` 
+WHERE company_name IN ('Cantor Fitzgerald US', 'BGC Partners') 
+AND email NOT IN (SELECT email FROM `woe-system.tableau.tbl_all_eng_events_all_users` WHERE company_name IN ('Cantor Fitzgerald US', 'BGC Partners') AND event_name = 'logged in');
+
+-- ALEX INTERVIEW LIST USERS
+DROP TABLE IF EXISTS `woe-system.prod_analytics.send_interview_email_for_alex_b` ; 
+CREATE TABLE `woe-system.prod_analytics.send_interview_email_for_alex_b` AS
+SELECT activated_user_id, email,
+SUM(IF(event_name_category IN ('on demand', 'joined live session', 'index complete'), 1, NULL)) AS engagement_count,
+-- SUM(COUNT(*)) OVER (PARTITION BY email) AS total_count,
+COUNT(*) AS interaction_count,
+MAX(date) AS last_engaged,
+ROUND(((COUNT(*) OVER () - ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC))/COUNT(*) OVER ())*100.0,0) AS percentile
+FROM `woe-system.tableau.tbl_all_eng_events_all_users` 
+WHERE core_clients = "Yes"
+AND event_name_category IN ('on demand', 'joined live session', 'index complete','registered', "logged in")
+AND core_clients = "Yes"
+GROUP BY 1,2
+HAVING engagement_count > 3
+AND MAX(DATE) >= '2023-01-01'
+AND email NOT IN (SELECT email FROM `woe-system.google_drive.product_interview_send_log_only_upload_sent_log`)
+ORDER BY interaction_count DESC
